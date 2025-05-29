@@ -2,65 +2,92 @@
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
-import base64
-from models import forecast_with_prophet, forecast_with_arima, forecast_with_lstm
+from prophet import Prophet
+from statsmodels.tsa.arima.model import ARIMA
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
 
-st.set_page_config(page_title="Drug Forecasting", layout="centered")
+# App title
+st.title("Drug Demand Forecasting App")
 
-def load_data(uploaded_file):
-    if uploaded_file.name.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    elif uploaded_file.name.endswith((".xls", ".xlsx")):
-        return pd.read_excel(uploaded_file)
-    else:
-        st.error("Unsupported file type")
-        return None
+# File uploader
+uploaded_file = st.file_uploader("Upload your dataset (CSV)", type=["csv"])
+if uploaded_file is not None:
+    df = pd.read_csv(uploaded_file)
+    st.subheader("Raw Data")
+    st.write(df.head())
 
-def get_download_link(df):
-    csv = df.to_csv(index=False)
-    b64 = base64.b64encode(csv.encode()).decode()
-    return f'<a href="data:file/csv;base64,{b64}" download="forecast.csv">Download Forecast CSV</a>'
+    # Column selection
+    date_col = st.selectbox("Select Date Column", df.columns)
+    value_col = st.selectbox("Select Demand Column", df.columns)
 
-def main():
-    st.title("💊 Drug Demand Forecasting")
+    # Forecasting horizon
+    periods = st.slider("Months to Forecast", min_value=1, max_value=24, value=12)
 
-    uploaded_file = st.file_uploader("📤 Upload Your Data File (CSV/Excel)", type=["csv", "xls", "xlsx"])
-    
-    if uploaded_file:
-        df = load_data(uploaded_file)
-        st.subheader("📈 Preview of Uploaded Data")
-        st.dataframe(df.head())
+    # Model selection
+    model_type = st.selectbox("Select Forecasting Model", ["Prophet", "ARIMA", "LSTM"])
 
-        forecast_days = st.number_input("⏳ Number of Days to Forecast", min_value=1, max_value=365, value=30)
-        model_type = st.selectbox("🧠 Choose Forecasting Model", ["Prophet", "ARIMA", "LSTM"])
+    # Forecast button
+    if st.button("Run Forecast"):
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df[[date_col, value_col]].rename(columns={date_col: "ds", value_col: "y"})
 
-        if st.button("🚀 Run Forecast"):
-            try:
-                with st.spinner("Running model..."):
-                    if model_type == "Prophet":
-                        forecast = forecast_with_prophet(df, forecast_days)
-                    elif model_type == "ARIMA":
-                        forecast = forecast_with_arima(df, forecast_days)
-                    else:
-                        forecast = forecast_with_lstm(df, forecast_days)
+        if model_type == "Prophet":
+            m = Prophet()
+            m.fit(df)
+            future = m.make_future_dataframe(periods=periods, freq='M')
+            forecast = m.predict(future)
+            st.subheader("Forecast Plot")
+            fig1 = m.plot(forecast)
+            st.pyplot(fig1)
 
-                st.success("✅ Forecast Complete!")
-                st.subheader("🔍 Forecast Results")
-                st.dataframe(forecast)
+        elif model_type == "ARIMA":
+            df_arima = df.set_index('ds')['y'].asfreq('M').fillna(method='ffill')
+            model = ARIMA(df_arima, order=(1,1,1))
+            model_fit = model.fit()
+            forecast = model_fit.forecast(steps=periods)
+            st.line_chart(pd.concat([df_arima, forecast.rename("Forecast")]))
 
-                st.subheader("📊 Forecast Plot")
-                plt.figure(figsize=(10, 5))
-                plt.plot(forecast["ds"], forecast["yhat"], label="Forecast")
-                plt.xlabel("Date")
-                plt.ylabel("Demand")
-                plt.legend()
-                st.pyplot(plt)
+        elif model_type == "LSTM":
+            data = df.set_index("ds").asfreq("M").fillna(method='ffill')
+            values = data["y"].values.reshape(-1, 1)
 
-                st.markdown(get_download_link(forecast), unsafe_allow_html=True)
+            scaler = MinMaxScaler()
+            scaled = scaler.fit_transform(values)
 
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
+            def create_dataset(series, time_step=5):
+                X, Y = [], []
+                for i in range(len(series) - time_step - 1):
+                    X.append(series[i:(i + time_step), 0])
+                    Y.append(series[i + time_step, 0])
+                return np.array(X), np.array(Y)
 
-if __name__ == "__main__":
-    main() 
+            time_step = 5
+            X, y = create_dataset(scaled, time_step)
+            X = X.reshape(X.shape[0], X.shape[1], 1)
+
+            model = Sequential([
+                LSTM(50, return_sequences=True, input_shape=(time_step, 1)),
+                LSTM(50),
+                Dense(1)
+            ])
+            model.compile(loss='mean_squared_error', optimizer='adam')
+            model.fit(X, y, epochs=10, batch_size=1, verbose=0)
+
+            x_input = scaled[-time_step:].reshape(1, time_step, 1)
+            predictions = []
+            for _ in range(periods):
+                next_val = model.predict(x_input)[0][0]
+                predictions.append(next_val)
+                x_input = np.append(x_input[:, 1:, :], [[[next_val]]], axis=1)
+
+            forecast = scaler.inverse_transform(np.array(predictions).reshape(-1, 1))
+            forecast_dates = pd.date_range(start=df['ds'].iloc[-1], periods=periods + 1, freq='M')[1:]
+            forecast_df = pd.DataFrame({'ds': forecast_dates, 'Forecast': forecast.flatten()})
+
+            st.line_chart(pd.concat([df.set_index("ds")["y"], forecast_df.set_index("ds")["Forecast"]], axis=1))
+
+ 
